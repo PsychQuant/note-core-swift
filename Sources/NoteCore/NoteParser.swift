@@ -40,6 +40,39 @@ public struct HandwritingEntry {
 public struct NoteParser {
     public init() {}
 
+    /// Paper aspect ratios (height / width in portrait orientation).
+    /// Keys are normalized lowercase. Values match standard PDF dimensions at 72 DPI.
+    /// Looked up by `documentPaperAttributes.paperSize` string from Session.plist.
+    internal static let paperAspectRatios: [String: Float] = [
+        "letter":  792.0 / 612.0,       // 8.5" × 11"
+        "legal":   1008.0 / 612.0,      // 8.5" × 14"
+        "a4":      841.68 / 595.2,      // ISO A4
+        "a3":      1190.4 / 841.68,     // ISO A3
+        "a5":      595.2 / 419.28,      // ISO A5
+        "tabloid": 1224.0 / 792.0,      // 11" × 17"
+        "b5":      708.48 / 498.96      // ISO B5
+    ]
+
+    /// Compute the logical page height in Notability's coordinate space, based on
+    /// `documentPaperAttributes.paperSize` + `paperOrientation`.
+    ///
+    /// Notability stores stroke coordinates in iPad logical units (pageWidth ≈ 583.8 pt
+    /// from `paperSizingBehavior: lockedWidth:583.8:iPad`), not PDF points.
+    /// The logical page height is derived by applying the paper's aspect ratio to pageWidth.
+    ///
+    /// Returns `nil` when paperSize is unknown (e.g., "customWidth" or legacy values),
+    /// so the caller can fallback to the stroke-bounds heuristic.
+    internal static func logicalPageHeight(
+        paperSize: String?,
+        paperOrientation: String?,
+        pageWidth: Float
+    ) -> Float? {
+        guard let size = paperSize?.lowercased(),
+              let ratio = paperAspectRatios[size] else { return nil }
+        let isLandscape = paperOrientation?.lowercased() == "landscape"
+        return isLandscape ? pageWidth / ratio : pageWidth * ratio
+    }
+
     public func parse(input: URL) throws -> ParsedNote {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("notability-\(UUID().uuidString)")
