@@ -11,8 +11,9 @@ public struct ParsedNote {
     public let handwritingIndex: [HandwritingEntry]?
     public let pageCount: Int
     public let title: String
-    public let pageWidth: Float   // in note coordinates
-    public let pageHeight: Float  // in note coordinates
+    public let pageWidth: Float    // in note coordinates
+    public let pageHeight: Float   // in note coordinates
+    public let pageYOffset: Float  // Y where page 1 starts (skips empty region above first stroke)
 }
 
 public struct RecordingInfo {
@@ -71,6 +72,32 @@ public struct NoteParser {
               let ratio = paperAspectRatios[size] else { return nil }
         let isLandscape = paperOrientation?.lowercased() == "landscape"
         return isLandscape ? pageWidth / ratio : pageWidth * ratio
+    }
+
+    /// Compute per-page Y bounds using a stroke-bounds heuristic.
+    ///
+    /// Notability's stroke coordinates form a flat global canvas — strokes have no
+    /// per-stroke page index, and `pageLayoutArray` provides no Y offsets. The only
+    /// ground truth available is the overall `StrokeBounds` and the total `pageCount`.
+    ///
+    /// Assumptions (both imperfect but best available):
+    /// - Pages are equal height.
+    /// - Strokes are distributed uniformly across pages.
+    ///
+    /// The `pageYOffset` matters because strokes usually do not start at Y=0 — the
+    /// first stroke on page 1 may be well below the top of the page. Starting page 1
+    /// at Y=0 would render empty space before the first stroke.
+    ///
+    /// Returns `(pageYOffset, pageHeight)` in note coordinates. `pageHeight` is
+    /// always positive (falls back to `max(maxY - minY, 1)` when `pageCount < 1`).
+    internal static func heuristicPageBounds(
+        bounds: StrokeBounds,
+        pageCount: Int
+    ) -> (pageYOffset: Float, pageHeight: Float) {
+        let offset = max(bounds.minY, 0)
+        let span = max(bounds.maxY - bounds.minY, 1)
+        let height = pageCount > 0 ? span / Float(pageCount) : span
+        return (pageYOffset: offset, pageHeight: height)
     }
 
     public func parse(input: URL) throws -> ParsedNote {
@@ -183,13 +210,13 @@ public struct NoteParser {
                 }
             }
         }
-        // Page height = total content height / page count (includes inter-page gap)
-        let pageHeight: Float
-        if pageCount > 1 {
-            pageHeight = (strokes.bounds.maxY + 20) / Float(pageCount)
-        } else {
-            pageHeight = strokes.bounds.maxY + 20
-        }
+        // Page bounds via stroke-bounds heuristic. pageYOffset accounts for strokes
+        // that don't start at Y=0 (e.g., Wei .note has minY ≈ 1146). See
+        // heuristicPageBounds() doc for caveats.
+        let (pageYOffset, pageHeight) = Self.heuristicPageBounds(
+            bounds: strokes.bounds,
+            pageCount: pageCount
+        )
 
         // Parse recordings
         let recordingsDir = noteDir.appendingPathComponent("Recordings")
@@ -292,7 +319,8 @@ public struct NoteParser {
             pageCount: max(pageCount, 1),
             title: title,
             pageWidth: pageWidth,
-            pageHeight: pageHeight
+            pageHeight: pageHeight,
+            pageYOffset: pageYOffset
         )
     }
 

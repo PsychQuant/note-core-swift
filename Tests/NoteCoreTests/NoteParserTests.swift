@@ -86,3 +86,57 @@ final class NoteParserLogicalPageHeightTests: XCTestCase {
         XCTAssertGreaterThan(h!, 583.8)
     }
 }
+
+final class NoteParserHeuristicPageBoundsTests: XCTestCase {
+
+    // MARK: - Realistic case (matches Wei .note debug data)
+
+    func testRealisticCase_5pages_nonZeroMinY() {
+        // Debug data from actual Wei .note (see #77 scope-guard comment):
+        // bounds.minY = 1146.02, bounds.maxY = 9075.37, pageCount = 5
+        let bounds = StrokeBounds(minX: -3.68, minY: 1146.02, maxX: 552.25, maxY: 9075.37)
+        let result = NoteParser.heuristicPageBounds(bounds: bounds, pageCount: 5)
+
+        // pageYOffset = minY (skip empty region above first stroke)
+        XCTAssertEqual(result.pageYOffset, 1146.02, accuracy: 0.01)
+
+        // pageHeight = (maxY - minY) / pageCount = 7929.35 / 5 = 1585.87
+        XCTAssertEqual(result.pageHeight, (9075.37 - 1146.02) / 5.0, accuracy: 0.01)
+    }
+
+    // MARK: - Edge cases
+
+    func testSinglePage() {
+        let bounds = StrokeBounds(minX: 0, minY: 100, maxX: 500, maxY: 800)
+        let result = NoteParser.heuristicPageBounds(bounds: bounds, pageCount: 1)
+
+        XCTAssertEqual(result.pageYOffset, 100, accuracy: 0.01)
+        XCTAssertEqual(result.pageHeight, 700, accuracy: 0.01)  // maxY - minY
+    }
+
+    func testZeroMinY() {
+        // If bounds.minY is 0, pageYOffset is 0 (fix degrades to same behavior as old)
+        let bounds = StrokeBounds(minX: 0, minY: 0, maxX: 500, maxY: 5000)
+        let result = NoteParser.heuristicPageBounds(bounds: bounds, pageCount: 5)
+
+        XCTAssertEqual(result.pageYOffset, 0, accuracy: 0.01)
+        XCTAssertEqual(result.pageHeight, 1000, accuracy: 0.01)
+    }
+
+    func testPageCountZero_safeDefault() {
+        // Divide-by-zero protection: pageCount=0 should not crash
+        let bounds = StrokeBounds(minX: 0, minY: 0, maxX: 500, maxY: 1000)
+        let result = NoteParser.heuristicPageBounds(bounds: bounds, pageCount: 0)
+
+        XCTAssertGreaterThan(result.pageHeight, 0, "pageHeight must be positive to avoid divide-by-zero downstream")
+    }
+
+    func testNegativeMinY_clampedToZero() {
+        // StrokeBounds could theoretically have negative minY.
+        // pageYOffset should clamp to >= 0 for safety.
+        let bounds = StrokeBounds(minX: -10, minY: -50, maxX: 500, maxY: 1000)
+        let result = NoteParser.heuristicPageBounds(bounds: bounds, pageCount: 1)
+
+        XCTAssertGreaterThanOrEqual(result.pageYOffset, 0, "pageYOffset should be clamped to >= 0")
+    }
+}
