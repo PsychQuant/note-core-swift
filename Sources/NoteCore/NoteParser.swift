@@ -169,8 +169,10 @@ public struct NoteParser {
             pageCount = 1
         }
 
-        // Parse paper width from NBNoteTakingSessionDocumentPaperLayoutModelKey
+        // Parse paper attributes from NBNoteTakingSessionDocumentPaperLayoutModelKey
         var pageWidth: Float = 583.8  // default: Notability letter width
+        var paperSize: String?
+        var paperOrientation: String?
         if let paperLayoutUID = navigator.uidValue(rootObj["NBNoteTakingSessionDocumentPaperLayoutModelKey"]),
            let paperLayout = navigator.object(at: paperLayoutUID) as? [String: Any],
            let paperAttrsUID = navigator.uidValue(paperLayout["documentPaperAttributes"]),
@@ -182,10 +184,27 @@ public struct NoteParser {
                     pageWidth = w
                 }
             }
+            if let sizeUID = navigator.uidValue(paperAttrs["paperSize"]),
+               let s = navigator.object(at: sizeUID) as? String {
+                paperSize = s
+            }
+            if let orientUID = navigator.uidValue(paperAttrs["paperOrientation"]),
+               let o = navigator.object(at: orientUID) as? String {
+                paperOrientation = o
+            }
         }
-        // Page height = total content height / page count (includes inter-page gap)
+
+        // Page height: prefer paperSize lookup (reliable); fallback to heuristic
+        // (total content height / page count). The heuristic is wrong when
+        // content is unevenly distributed across pages.
         let pageHeight: Float
-        if pageCount > 1 {
+        if let logicalH = Self.logicalPageHeight(
+            paperSize: paperSize,
+            paperOrientation: paperOrientation,
+            pageWidth: pageWidth
+        ) {
+            pageHeight = logicalH
+        } else if pageCount > 1 {
             pageHeight = (strokes.bounds.maxY + 20) / Float(pageCount)
         } else {
             pageHeight = strokes.bounds.maxY + 20
