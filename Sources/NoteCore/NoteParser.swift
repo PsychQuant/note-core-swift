@@ -1,6 +1,24 @@
 import Foundation
 import ZIPFoundation
 
+/// Per-page Y-coordinate bounds in Notability's stroke coordinate space.
+///
+/// Populated by gutter-gap detection or even-split fallback during `NoteParser.parse(...)`.
+/// When non-empty, `pageBounds` is authoritative for per-page rendering boundaries;
+/// `ParsedNote.pageHeight` / `pageYOffset` are kept for backwards compatibility with
+/// consumers built against 0.1.3.
+public struct PageBounds: Equatable {
+    public let yStart: Float
+    public let yEnd: Float
+    public let documentPageNumber: Int
+
+    public init(yStart: Float, yEnd: Float, documentPageNumber: Int) {
+        self.yStart = yStart
+        self.yEnd = yEnd
+        self.documentPageNumber = documentPageNumber
+    }
+}
+
 /// Parsed contents of a .note file.
 public struct ParsedNote {
     public let strokes: StrokeData
@@ -14,6 +32,10 @@ public struct ParsedNote {
     public let pageWidth: Float    // in note coordinates
     public let pageHeight: Float   // in note coordinates
     public let pageYOffset: Float  // Y where page 1 starts (skips empty region above first stroke)
+    /// Per-page Y bounds derived from gutter-gap detection or even-split fallback.
+    /// Empty when the note contains zero strokes. Otherwise contains exactly
+    /// `pageCount` entries in ascending `documentPageNumber` order.
+    public let pageBounds: [PageBounds]
 }
 
 public struct RecordingInfo {
@@ -54,15 +76,21 @@ public struct NoteParser {
         "b5":      708.48 / 498.96      // ISO B5
     ]
 
-    /// Compute the logical page height in Notability's coordinate space, based on
-    /// `documentPaperAttributes.paperSize` + `paperOrientation`.
+    /// Compute the logical page height in Notability's coordinate space from paperSize.
     ///
-    /// Notability stores stroke coordinates in iPad logical units (pageWidth ≈ 583.8 pt
-    /// from `paperSizingBehavior: lockedWidth:583.8:iPad`), not PDF points.
-    /// The logical page height is derived by applying the paper's aspect ratio to pageWidth.
+    /// **Last-resort fallback only.** Empirical observation shows this derivation drifts
+    /// up to 22.7 pt per page against real stroke bounds on iPad `.note` v9 files (a
+    /// 9-page letter-portrait note accumulates ~204 pt of cumulative drift by page 9),
+    /// causing strokes to visibly cross PDF page boundaries. Gutter-gap detection
+    /// (`gutterDetection(...)`) and the stroke-bounds even-split fallback
+    /// (`heuristicPageBounds(...)`) are preferred; this helper SHALL NOT be the
+    /// primary source of `pageHeight` for layout decisions.
     ///
-    /// Returns `nil` when paperSize is unknown (e.g., "customWidth" or legacy values),
-    /// so the caller can fallback to the stroke-bounds heuristic.
+    /// Kept only to cover edge cases where both primary methods yield no usable result
+    /// (e.g., a zero-stroke note with non-zero `pageLayoutArray` length).
+    ///
+    /// Returns `nil` when paperSize is unknown so the caller can fall through to the
+    /// next tier of fallback.
     internal static func logicalPageHeight(
         paperSize: String?,
         paperOrientation: String?,
@@ -98,6 +126,120 @@ public struct NoteParser {
         let span = max(bounds.maxY - bounds.minY, 1)
         let height = pageCount > 0 ? span / Float(pageCount) : span
         return (pageYOffset: offset, pageHeight: height)
+    }
+
+    /// Detect gutters (near-empty Y-density bands) between logical pages via a
+    /// single-pass histogram scan. When exactly `pageCount - 1` qualifying gutters
+    /// are found inside the stroke's Y range, return `pageCount` `PageBounds` using
+    /// the gutter midpoints as page boundaries. Otherwise return an empty array so
+    /// callers can fall back to `heuristicPageBounds(...)`.
+    ///
+    /// A gutter qualifies when its Y extent is at least `minGutterHeight` AND its
+    /// stroke-point density is below `quietBandThreshold × peakDensity`.
+    ///
+    /// - Parameters:
+    ///   - strokes: Stroke data to analyse.
+    ///   - pageCount: Expected number of pages (from `pageLayoutArray`).
+    ///   - minGutterHeight: Minimum gutter height in note coordinates (default 40).
+    ///   - quietBandThreshold: Fraction of peak density below which a bucket is
+    ///     considered quiet (default 0.01).
+    ///   - bucketSize: Histogram bucket size in note Y units (default 2).
+    /// - Returns: Exactly `pageCount` `PageBounds` entries on success, or empty on
+    ///   failure (wrong gutter count, too few strokes, or pageCount < 2).
+    internal static func gutterDetection(
+        strokes: StrokeData,
+        pageCount: Int,
+        minGutterHeight: Float = 40,
+        quietBandThreshold: Float = 0.01,
+        bucketSize: Float = 2
+    ) -> [PageBounds] {
+        guard pageCount >= 2, !strokes.curves.isEmpty else { return [] }
+        let bounds = strokes.bounds
+        let span = bounds.maxY - bounds.minY
+        guard span > minGutterHeight else { return [] }
+
+        let bucketCount = max(Int((span / bucketSize).rounded(.up)), 1)
+        guard bucketCount >= 2 else { return [] }
+
+        // Single-pass histogram build — O(numpoints)
+        var histogram = [Int](repeating: 0, count: bucketCount)
+        for curve in strokes.curves {
+            for point in curve.points {
+                let relY = point.y - bounds.minY
+                let idx = min(max(Int(relY / bucketSize), 0), bucketCount - 1)
+                histogram[idx] += 1
+            }
+        }
+
+        let peak = histogram.max() ?? 0
+        guard peak > 0 else { return [] }
+        let quietThreshold = Int((Float(peak) * quietBandThreshold).rounded())
+
+        // Scan for contiguous quiet bands (gutters). A "run" is a contiguous
+        // sequence of buckets at or below the quiet threshold.
+        struct Gutter { let startBucket: Int; let endBucket: Int }
+        var gutters: [Gutter] = []
+        var currentStart: Int? = nil
+        for i in 0..<bucketCount {
+            if histogram[i] <= quietThreshold {
+                if currentStart == nil { currentStart = i }
+            } else if let start = currentStart {
+                gutters.append(Gutter(startBucket: start, endBucket: i - 1))
+                currentStart = nil
+            }
+        }
+        // Any trailing quiet band beyond the last stroke is not a page break.
+
+        // Qualifying: at least `minBuckets` wide
+        let minBuckets = max(Int((minGutterHeight / bucketSize).rounded(.up)), 1)
+        let qualifying = gutters.filter { ($0.endBucket - $0.startBucket + 1) >= minBuckets }
+
+        // Need exactly pageCount - 1 internal gutters between pages
+        guard qualifying.count == pageCount - 1 else { return [] }
+
+        // Compute page bounds from gutter midpoints
+        var pageBounds: [PageBounds] = []
+        var prevY = bounds.minY
+        for (i, gutter) in qualifying.enumerated() {
+            let midBucket = (gutter.startBucket + gutter.endBucket) / 2
+            let midY = bounds.minY + Float(midBucket) * bucketSize
+            pageBounds.append(PageBounds(
+                yStart: prevY,
+                yEnd: midY,
+                documentPageNumber: i + 1
+            ))
+            prevY = midY
+        }
+        pageBounds.append(PageBounds(
+            yStart: prevY,
+            yEnd: bounds.maxY,
+            documentPageNumber: pageCount
+        ))
+        return pageBounds
+    }
+
+    /// Derive even-split `PageBounds` from stroke-bounds heuristic values.
+    ///
+    /// Used as the fallback population path when `gutterDetection(...)` yields
+    /// no qualifying gutters. Guarantees that downstream consumers receive a
+    /// non-empty `pageBounds` array for any note with at least one stroke.
+    internal static func evenSplitPageBounds(
+        pageYOffset: Float,
+        pageHeight: Float,
+        pageCount: Int
+    ) -> [PageBounds] {
+        guard pageCount >= 1, pageHeight > 0 else { return [] }
+        var bounds: [PageBounds] = []
+        for i in 0..<pageCount {
+            let yStart = pageYOffset + Float(i) * pageHeight
+            let yEnd = yStart + pageHeight
+            bounds.append(PageBounds(
+                yStart: yStart,
+                yEnd: yEnd,
+                documentPageNumber: i + 1
+            ))
+        }
+        return bounds
     }
 
     public func parse(input: URL) throws -> ParsedNote {
@@ -210,13 +352,27 @@ public struct NoteParser {
                 }
             }
         }
-        // Page bounds via stroke-bounds heuristic. pageYOffset accounts for strokes
-        // that don't start at Y=0 (e.g., Wei .note has minY ≈ 1146). See
-        // heuristicPageBounds() doc for caveats.
+        // Page bounds — primary via gutter-gap detection, fallback to even-split.
+        // When strokes exist: pageBounds is populated by either path so downstream
+        // consumers always receive a consistent data shape. When zero strokes:
+        // pageBounds is left empty; consumers read pageCount from pageLayoutArray.
         let (pageYOffset, pageHeight) = Self.heuristicPageBounds(
             bounds: strokes.bounds,
             pageCount: pageCount
         )
+        let gutterBounds = Self.gutterDetection(strokes: strokes, pageCount: pageCount)
+        let pageBounds: [PageBounds]
+        if !gutterBounds.isEmpty {
+            pageBounds = gutterBounds
+        } else if !strokes.curves.isEmpty {
+            pageBounds = Self.evenSplitPageBounds(
+                pageYOffset: pageYOffset,
+                pageHeight: pageHeight,
+                pageCount: pageCount
+            )
+        } else {
+            pageBounds = []
+        }
 
         // Parse recordings
         let recordingsDir = noteDir.appendingPathComponent("Recordings")
@@ -320,7 +476,8 @@ public struct NoteParser {
             title: title,
             pageWidth: pageWidth,
             pageHeight: pageHeight,
-            pageYOffset: pageYOffset
+            pageYOffset: pageYOffset,
+            pageBounds: pageBounds
         )
     }
 
